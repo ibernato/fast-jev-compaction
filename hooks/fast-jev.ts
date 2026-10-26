@@ -1,4 +1,5 @@
 import type {
+  EngineInterface,
   On,
   PluginOptions,
   Register,
@@ -259,8 +260,10 @@ function notify(
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  let compactQueued = false;
 
   on('session.compact', async ($, event, next) => {
+    compactQueued = false;
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
@@ -289,17 +292,35 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
   });
 
+  // Headless sessions cannot compact directly; /compact runs once the session is idle.
+  function queueCompactPrompt($: EngineInterface): void {
+    compactQueued = true;
+    const skipped = (error: unknown) => {
+      compactQueued = false;
+      $.ui.log(`auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
+    };
+    try {
+      void Promise.resolve($.prompt.submit({ text: '/compact' })).catch(skipped);
+      $.ui.log('auto-compact queued as /compact (headless session)');
+    } catch (error) {
+      skipped(error);
+    }
+  }
+
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    if (compacting || compactQueued) return next(event);
     try {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
       compacting = true;
       await $.session.compact();
     } catch (error) {
-      $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('headless')) {
+        queueCompactPrompt($);
+      } else {
+        $.ui.log(`auto-compact skipped (${message})`);
+      }
     } finally {
       compacting = false;
     }

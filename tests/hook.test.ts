@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -145,5 +146,65 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('auto-compact on turn.complete', () => {
+  type Handler = (...args: any[]) => Promise<unknown>;
+
+  function setup(compact: () => Promise<void>, submit: () => unknown = () => Promise.resolve()) {
+    const handlers: Record<string, Handler> = {};
+    const logs: string[] = [];
+    const submits: unknown[] = [];
+    const $ = {
+      session: { usage: async () => ({ context: { percent: 80 } }), compact },
+      prompt: { submit: (input: unknown) => (submits.push(input), submit()) },
+      ui: { log: (text: string) => logs.push(text), toast: () => undefined },
+      http: { fetch: async () => ({ status: 500, ok: false, text: 'x' }) },
+    };
+    (register as any)((name: string, handler: Handler) => (handlers[name] = handler), {});
+    const next = async (event: unknown) => event;
+    return {
+      logs,
+      submits,
+      turn: () => handlers['turn.complete']!($, {}, next),
+      compactEvent: () => handlers['session.compact']!($, { messages: [] }, next),
+    };
+  }
+
+  const headless = () =>
+    Promise.reject(new Error('$.session.compact: not available in a headless (-p / SDK) session yet'));
+
+  it('queues /compact once when compaction is unavailable in a headless session', async () => {
+    const t = setup(headless);
+    await t.turn();
+    await t.turn();
+    expect(t.submits).toEqual([{ text: '/compact' }]);
+    expect(t.logs).toEqual(['auto-compact queued as /compact (headless session)']);
+  });
+
+  it('clears the queued guard when session.compact runs so a later turn can queue again', async () => {
+    const t = setup(headless);
+    await t.turn();
+    await t.compactEvent();
+    await t.turn();
+    expect(t.submits).toHaveLength(2);
+  });
+
+  it('logs a skip and does not submit for a non-headless error', async () => {
+    const t = setup(() => Promise.reject(new Error('boom')));
+    await t.turn();
+    expect(t.submits).toEqual([]);
+    expect(t.logs).toEqual(['auto-compact skipped (boom)']);
+  });
+
+  it('clears the guard and logs a skip when prompt.submit fails', async () => {
+    const t = setup(headless, () => {
+      throw new Error('nope');
+    });
+    await t.turn();
+    await t.turn();
+    expect(t.submits).toHaveLength(2);
+    expect(t.logs).toEqual(['auto-compact skipped (nope)', 'auto-compact skipped (nope)']);
   });
 });
